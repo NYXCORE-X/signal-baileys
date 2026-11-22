@@ -28,6 +28,12 @@ import type {
 import { resolveAuthPath } from '../Utils/auth.js'
 import { makeLogger } from '../Utils/logger.js'
 import { printQRToTerminal } from '../Utils/qr.js'
+import {
+  downloadMediaMessage as downloadMediaMessageHelper,
+  downloadAttachment as downloadAttachmentHelper,
+  sendMediaMessage,
+} from '../Utils/media.js'
+import { loadNative, hasNativeDownload, hasNativeUpload } from '../Utils/native.js'
 
 export type SignalSocket = ReturnType<typeof makeSignalSocket>
 
@@ -39,23 +45,40 @@ function stripJid(jid: string): string {
   return jid.replace(/@s\.signal$/i, '').replace(/@g\.us$/i, '').trim()
 }
 
-function mapAttachments(raw: any[]): SignalAttachment[] {
+function mapAttachments(raw: any[], downloadAvailable: boolean): SignalAttachment[] {
   if (!Array.isArray(raw)) return []
-  return raw.map((a) => ({
-    contentType: a.contentType ?? a.content_type ?? 'application/octet-stream',
-    fileName: a.fileName ?? a.file_name ?? null,
-    size: a.size ?? null,
-    // Native layer currently exposes metadata only; download planned upstream
-    downloadAvailable: false,
-  }))
+  return raw.map((a) => {
+    const contentType = a.contentType ?? a.content_type ?? 'application/octet-stream'
+    const fileName = a.fileName ?? a.file_name ?? null
+    const size = a.size ?? null
+    // Keep unknown fields for future native download pointers (cdnKey, digest, …)
+    const known = new Set([
+      'contentType',
+      'content_type',
+      'fileName',
+      'file_name',
+      'size',
+    ])
+    const rawExtra: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(a)) {
+      if (!known.has(k)) rawExtra[k] = v
+    }
+    return {
+      contentType,
+      fileName,
+      size,
+      downloadAvailable,
+      raw: Object.keys(rawExtra).length ? rawExtra : { contentType, fileName, size },
+    }
+  })
 }
 
-function mapIncoming(raw: any): SignalMessage {
+function mapIncoming(raw: any, downloadAvailable: boolean): SignalMessage {
   const text = raw.text ?? null
   const senderUuid = raw.senderUuid ?? raw.sender_uuid ?? ''
   const groupId = raw.groupId ?? raw.group_id ?? null
   const timestamp = Number(raw.timestamp ?? Date.now())
-  const attachments = mapAttachments(raw.attachments ?? [])
+  const attachments = mapAttachments(raw.attachments ?? [], downloadAvailable)
   const isReaction = !!raw.isReaction
 
   let message: SignalMessage['message']
@@ -75,31 +98,15 @@ function mapIncoming(raw: any): SignalMessage {
   } else if (attachments.length) {
     const first = attachments[0]
     const ct = (first.contentType || '').toLowerCase()
-    if (ct.startsWith('image/')) {
-      message = {
-        imageMessage: {
-          mimetype: first.contentType,
-          fileName: first.fileName ?? undefined,
-          fileLength: first.size ?? undefined,
-        },
-      }
-    } else if (ct.startsWith('video/')) {
-      message = {
-        videoMessage: {
-          mimetype: first.contentType,
-          fileName: first.fileName ?? undefined,
-          fileLength: first.size ?? undefined,
-        },
-      }
-    } else {
-      message = {
-        documentMessage: {
-          mimetype: first.contentType,
-          fileName: first.fileName ?? undefined,
-          fileLength: first.size ?? undefined,
-        },
-      }
+    const fields = {
+      mimetype: first.contentType,
+      fileName: first.fileName ?? undefined,
+      fileLength: first.size ?? undefined,
     }
+    if (ct.startsWith('image/')) message = { imageMessage: fields }
+    else if (ct.startsWith('video/')) message = { videoMessage: fields }
+    else if (ct.startsWith('audio/')) message = { audioMessage: fields }
+    else message = { documentMessage: fields }
   }
 
   return {
@@ -118,9 +125,6 @@ function mapIncoming(raw: any): SignalMessage {
   }
 }
 
-/**
- * Create a Baileys-style Signal socket.
- */
 export function makeSignalSocket(config: SignalSocketConfig) {
   const dataPath = resolveAuthPath(config.auth)
   const deviceName = config.deviceName ?? 'Signal Baileys'
@@ -139,36 +143,47 @@ export function makeSignalSocket(config: SignalSocketConfig) {
   let receiveLoopRunning = false
   let closed = false
   let profileCache: SignalProfile | null = null
+  let mediaCaps = { download: false, upload: false }
 
   const emitConnection = (update: ConnectionUpdate) => {
     ev.emit('connection.update', update)
   }
 
+  async function probeMediaCaps() {
+    try {
+      const n = await loadNative()
+      mediaCaps = {
+        download: hasNativeDownload(n),
+        upload: hasNativeUpload(n),
+      }
+      if (!mediaCaps.download || !mediaCaps.upload) {
+        logger.debug(
+          mediaCaps,
+          'Native attachment download/upload not available yet — metadata only'
+        )
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
   async function startLinkFlow() {
     try {
       emitConnection({ connection: 'connecting' })
-
       const provisioningUrl = await linkDevice(dataPath, deviceName)
-
-      if (printQR) {
-        await printQRToTerminal(provisioningUrl)
-      }
-
+      if (printQR) await printQRToTerminal(provisioningUrl)
       emitConnection({ connection: 'connecting', qr: provisioningUrl })
-
       await finishLink(dataPath)
       isLinked = true
-
       try {
         profileCache = await getProfile(dataPath)
       } catch {
         /* ignore */
       }
-
+      await probeMediaCaps()
       emitConnection({ connection: 'open', isNewLogin: true })
       logger.info({ phone: profileCache?.phoneNumber }, 'Device linked successfully')
       ev.emit('creds.update')
-
       await refreshContactsAndGroups()
       startReceiveLoop()
     } catch (err: any) {
@@ -185,20 +200,11 @@ export function makeSignalSocket(config: SignalSocketConfig) {
     try {
       emitConnection({ connection: 'connecting' })
       logger.info({ phone: reg.phoneNumber }, 'Starting primary registration')
-
-      // Native API exists; may throw if not fully implemented upstream
       await nativeRegister(dataPath, reg.phoneNumber, !!reg.useVoice)
-
-      emitConnection({
-        connection: 'connecting',
-        registrationCodeRequired: true,
-      })
+      emitConnection({ connection: 'connecting', registrationCodeRequired: true })
       logger.info('Awaiting SMS/voice confirmation code — call sock.confirmRegistration(code)')
     } catch (err: any) {
-      logger.error(
-        { err },
-        'Primary registration failed (native layer may still be incomplete — prefer linkDevice)'
-      )
+      logger.error({ err }, 'Primary registration failed')
       emitConnection({
         connection: 'close',
         lastDisconnect: { error: err, date: new Date() },
@@ -213,6 +219,7 @@ export function makeSignalSocket(config: SignalSocketConfig) {
       const profile = await getProfile(dataPath)
       isLinked = true
       profileCache = profile
+      await probeMediaCaps()
       logger.info({ phone: profile?.phoneNumber }, 'Restored existing session')
       emitConnection({ connection: 'open' })
       await refreshContactsAndGroups()
@@ -241,15 +248,19 @@ export function makeSignalSocket(config: SignalSocketConfig) {
   function startReceiveLoop() {
     if (receiveLoopRunning || closed) return
     receiveLoopRunning = true
-
     ;(async () => {
       try {
         await receiveMessages(dataPath, (raw: any) => {
           if (closed) return
-          if (raw?.isQueueEmpty && !raw?.text && !raw?.isReaction && !(raw?.attachments?.length)) {
+          if (
+            raw?.isQueueEmpty &&
+            !raw?.text &&
+            !raw?.isReaction &&
+            !(raw?.attachments?.length)
+          ) {
             return
           }
-          const msg = mapIncoming(raw)
+          const msg = mapIncoming(raw, mediaCaps.download)
           ev.emit('messages.upsert', [msg], 'notify')
         })
       } catch (err: any) {
@@ -269,23 +280,16 @@ export function makeSignalSocket(config: SignalSocketConfig) {
   const sock = {
     ev,
 
-    /** Start connection (restore session, link, or primary register) */
     async connect() {
       const restored = await tryExistingSession()
       if (restored) return
-
       if (config.registration?.phoneNumber) {
         await startPrimaryRegistration()
         return
       }
-
       await startLinkFlow()
     },
 
-    /**
-     * Confirm primary registration with the SMS/voice code.
-     * Only needed when using config.registration.
-     */
     async confirmRegistration(code: string) {
       await nativeConfirmRegistration(dataPath, code)
       isLinked = true
@@ -294,6 +298,7 @@ export function makeSignalSocket(config: SignalSocketConfig) {
       } catch {
         /* ignore */
       }
+      await probeMediaCaps()
       emitConnection({ connection: 'open', isNewLogin: true })
       ev.emit('creds.update')
       await refreshContactsAndGroups()
@@ -302,50 +307,94 @@ export function makeSignalSocket(config: SignalSocketConfig) {
     },
 
     /**
-     * Send a text message or a reaction.
+     * Send text, reaction, or media.
      *
-     * jid formats:
-     * - `uuid` or `uuid@s.signal` → individual
-     * - `groupMasterKeyHex@g.us` or bare group id → group
+     * Media examples:
+     *   await sock.sendMessage(jid, { image: { url: './pic.jpg' }, caption: 'hi' })
+     *   await sock.sendMessage(jid, { document: { url: './file.pdf', fileName: 'file.pdf' } })
      */
     async sendMessage(
       jid: string,
       content: AnyMessageContent
     ): Promise<{ timestamp: number }> {
-      // Reaction path
       if (typeof content === 'object' && content !== null && 'react' in content) {
         const { text: emoji, key } = content.react
         const target = stripJid(key.remoteJid || jid)
-        const targetTs = Number(key.id)
-        await nativeSendReaction(dataPath, target, emoji, targetTs)
+        await nativeSendReaction(dataPath, target, emoji, Number(key.id))
         return { timestamp: Date.now() }
       }
 
-      const text = typeof content === 'string' ? content : content.text
       const target = stripJid(jid)
+      const group = isGroupJid(jid) || jid.endsWith('@g.us')
 
-      if (isGroupJid(jid) || jid.endsWith('@g.us')) {
+      if (typeof content === 'object' && content !== null) {
+        if ('image' in content) {
+          return sendMediaMessage(
+            dataPath,
+            target,
+            group,
+            content.image,
+            content.caption ?? content.image.caption
+          )
+        }
+        if ('video' in content) {
+          return sendMediaMessage(
+            dataPath,
+            target,
+            group,
+            content.video,
+            content.caption ?? content.video.caption
+          )
+        }
+        if ('audio' in content) {
+          return sendMediaMessage(dataPath, target, group, content.audio)
+        }
+        if ('document' in content) {
+          return sendMediaMessage(dataPath, target, group, {
+            ...content.document,
+            mimetype: content.mimetype ?? content.document.mimetype,
+            fileName: content.fileName ?? content.document.fileName,
+          })
+        }
+      }
+
+      const text = typeof content === 'string' ? content : (content as { text: string }).text
+      if (group) {
         const result = await nativeSendGroupMessage(dataPath, target, text)
         return { timestamp: result?.timestamp ?? Date.now() }
       }
-
       const result = await nativeSendMessage(dataPath, target, text)
       return { timestamp: result?.timestamp ?? Date.now() }
     },
 
-    /** Convenience: react to a message */
     async sendReaction(jid: string, emoji: string, targetTimestamp: number) {
-      const target = stripJid(jid)
-      await nativeSendReaction(dataPath, target, emoji, targetTimestamp)
+      await nativeSendReaction(dataPath, stripJid(jid), emoji, targetTimestamp)
     },
 
-    /** List stored contacts */
+    /**
+     * Download media bytes for an incoming message.
+     * Requires native `downloadAttachment` (not shipped yet in @milady/signal-native).
+     */
+    async downloadMediaMessage(
+      message: SignalMessage,
+      opts?: { attachmentIndex?: number }
+    ): Promise<Buffer> {
+      return downloadMediaMessageHelper(dataPath, message, opts)
+    },
+
+    async downloadAttachment(attachment: SignalAttachment): Promise<Buffer> {
+      return downloadAttachmentHelper(dataPath, attachment)
+    },
+
+    /** Whether current native build supports attachment binary transfer */
+    get mediaCapabilities() {
+      return { ...mediaCaps }
+    },
+
     async groupFetchAllParticipating(): Promise<Record<string, SignalGroup>> {
       const groups = (await listGroups(dataPath)) as SignalGroup[]
       const map: Record<string, SignalGroup> = {}
-      for (const g of groups) {
-        map[`${g.id}@g.us`] = g
-      }
+      for (const g of groups) map[`${g.id}@g.us`] = g
       return map
     },
 
@@ -366,7 +415,6 @@ export function makeSignalSocket(config: SignalSocketConfig) {
       }
     },
 
-    /** Graceful shutdown */
     async end() {
       closed = true
       try {
