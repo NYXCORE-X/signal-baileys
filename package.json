@@ -1,7 +1,7 @@
 {
   "name": "signal-baileys",
-  "version": "0.1.0",
-  "description": "Baileys-style Signal connector for Node.js — clean TypeScript API, device linking, events, and multi-device support.",
+  "version": "0.2.0",
+  "description": "Baileys-style Signal connector for Node.js — QR linking, groups, reactions, registration, Redis auth.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -16,6 +16,7 @@
     "dev": "tsx src/index.ts",
     "example:link": "tsx examples/link-device.ts",
     "example:bot": "tsx examples/simple-bot.ts",
+    "example:register": "tsx examples/primary-register.ts",
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist"
   },
@@ -26,7 +27,9 @@
     "bot",
     "e2ee",
     "signal-protocol",
-    "whatsapp-alternative"
+    "whatsapp-alternative",
+    "reactions",
+    "groups"
   ],
   "author": "NYXCORE-X",
   "license": "MIT",
@@ -35,11 +38,16 @@
   },
   "dependencies": {
     "@milady/signal-native": "^0.1.0",
-    "pino": "^9.5.0",
-    "events": "^3.3.0"
+    "pino": "^9.5.0"
+  },
+  "optionalDependencies": {
+    "qrcode": "^1.5.4",
+    "ioredis": "^5.4.2",
+    "pino-pretty": "^13.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "@types/qrcode": "^1.5.5",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
   }
