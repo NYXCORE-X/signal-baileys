@@ -1,0 +1,14 @@
+node_modules/
+dist/
+*.log
+.env
+.env.*
+!.env.example
+signal-data/
+.auth/
+*.db
+.DS_Store
+coverage/
+.idea/
+.vscode/
+*.tsbuildinfo
