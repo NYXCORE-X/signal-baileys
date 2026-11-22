@@ -3,34 +3,21 @@ import type { Logger } from 'pino'
 export type ConnectionState = 'close' | 'connecting' | 'open'
 
 export interface SignalAuthState {
-  /** Directory where session data (crypto) is stored */
   dataPath: string
-  /** Whether the device is already linked / registered */
   linked: boolean
 }
 
-/** Custom auth provider contract (Redis, DB, etc.) */
 export interface AuthStateProvider {
   dataPath: string
   linked?: boolean
 }
 
 export interface SignalSocketConfig {
-  /** Auth state / data directory / custom provider */
   auth: SignalAuthState | AuthStateProvider | string
-  /** Device name shown in Signal (default: Signal Baileys) */
   deviceName?: string
-  /** Pino logger instance */
   logger?: Logger
-  /** Mark online on connect */
   markOnlineOnConnect?: boolean
-  /** Print QR in terminal (uses qrcode if installed) */
   printQRInTerminal?: boolean
-  /**
-   * Primary registration options.
-   * If set, connect() will register as primary instead of linking.
-   * Note: underlying native register/confirm may still be incomplete — prefer link for now.
-   */
   registration?: {
     phoneNumber: string
     useVoice?: boolean
@@ -44,7 +31,6 @@ export interface SignalContact {
 }
 
 export interface SignalGroup {
-  /** Group master key (hex) or native id string */
   id: string
   name: string
   description?: string | null
@@ -56,12 +42,22 @@ export interface SignalProfile {
   phoneNumber?: string | null
 }
 
+/** Raw attachment pointer as returned by native (may grow when upstream adds fields) */
 export interface SignalAttachment {
   contentType: string
   fileName?: string | null
   size?: number | null
-  /** Download not yet exposed by native layer — metadata only for now */
+  /** True when native exposes downloadAttachment */
   downloadAvailable?: boolean
+  /** Opaque fields forwarded from native for download (cdnId, key, digest, …) */
+  raw?: Record<string, unknown>
+}
+
+export interface MediaMessageFields {
+  mimetype?: string
+  fileName?: string
+  fileLength?: number
+  caption?: string
 }
 
 export interface SignalMessage {
@@ -75,9 +71,10 @@ export interface SignalMessage {
   message?: {
     conversation?: string
     extendedTextMessage?: { text: string }
-    imageMessage?: { mimetype?: string; fileName?: string; fileLength?: number }
-    videoMessage?: { mimetype?: string; fileName?: string; fileLength?: number }
-    documentMessage?: { mimetype?: string; fileName?: string; fileLength?: number }
+    imageMessage?: MediaMessageFields
+    videoMessage?: MediaMessageFields
+    audioMessage?: MediaMessageFields & { ptt?: boolean }
+    documentMessage?: MediaMessageFields
     reactionMessage?: {
       text: string
       key: { id: string; remoteJid: string }
@@ -87,7 +84,6 @@ export interface SignalMessage {
   groupId?: string | null
   attachments?: SignalAttachment[]
   isReaction?: boolean
-  /** True when the native queue is drained */
   isQueueEmpty?: boolean
 }
 
@@ -99,8 +95,18 @@ export interface ConnectionUpdate {
   }
   qr?: string
   isNewLogin?: boolean
-  /** Set during primary registration when SMS/voice code is expected */
   registrationCodeRequired?: boolean
+}
+
+/** Local file to upload as attachment */
+export interface MediaUploadData {
+  /** Absolute or relative path to file */
+  url?: string
+  /** Or raw bytes */
+  buffer?: Buffer | Uint8Array
+  mimetype?: string
+  fileName?: string
+  caption?: string
 }
 
 export type AnyMessageContent =
@@ -112,6 +118,10 @@ export type AnyMessageContent =
         key: { id: string; remoteJid?: string }
       }
     }
+  | { image: MediaUploadData; caption?: string }
+  | { video: MediaUploadData; caption?: string }
+  | { audio: MediaUploadData; ptt?: boolean }
+  | { document: MediaUploadData; mimetype?: string; fileName?: string }
 
 export type SignalEventMap = {
   'connection.update': (update: ConnectionUpdate) => void
