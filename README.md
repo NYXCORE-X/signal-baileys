@@ -11,36 +11,77 @@ Clean TypeScript API inspired by [Baileys](https://github.com/WhiskeySockets/Bai
 | Feature | Status |
 |--------|--------|
 | Device linking (QR / secondary) | ✅ |
-| Terminal QR rendering | ✅ (install optional `qrcode`) |
+| Terminal QR rendering | ✅ (optional `qrcode`) |
 | Session restore | ✅ |
 | Send / receive text | ✅ |
 | Groups list + send to group | ✅ |
 | Reactions (send + receive) | ✅ |
-| Incoming attachment **metadata** | ✅ (download not yet in native layer) |
-| Primary registration (SMS/voice) | ⚠️ Wired — native may still be incomplete |
-| Multi-file auth state | ✅ |
+| Attachment **metadata** | ✅ |
+| Attachment **download / upload API** | ✅ ready — needs native bindings |
+| Primary registration (SMS/voice) | ⚠️ Wired |
+| Multi-file auth | ✅ |
 | Redis auth metadata | ✅ (optional `ioredis`) |
-| Contacts list | ✅ |
 
 ## Install
 
 ```bash
 npm install signal-baileys
-# recommended for nicer QR in terminal:
-npm install qrcode
-# optional Redis metadata store:
-npm install ioredis
+npm install qrcode   # nicer terminal QR
 ```
 
-Node.js ≥ 20.
+## Media (download / upload)
 
-## Quick start (link + bot)
+Baileys-style API is implemented in this package:
+
+```ts
+// Send image / video / document / audio
+await sock.sendMessage(jid, {
+  image: { url: './photo.jpg' },
+  caption: 'hello',
+})
+
+await sock.sendMessage(jid, {
+  document: { url: './report.pdf', fileName: 'report.pdf', mimetype: 'application/pdf' },
+})
+
+// Download incoming media
+sock.ev.on('messages.upsert', async (msgs) => {
+  for (const m of msgs) {
+    if (!m.attachments?.length) continue
+    try {
+      const buf = await sock.downloadMediaMessage(m)
+      await writeFile(`./inbox/${m.attachments[0].fileName ?? 'file'}`, buf)
+    } catch (e: any) {
+      if (e.code === 'ERR_SIGNAL_ATTACHMENT_NATIVE_MISSING') {
+        console.log('Native binary transfer not available yet — metadata only:', m.attachments)
+      } else throw e
+    }
+  }
+})
+
+// Capability probe
+console.log(sock.mediaCapabilities) // { download: false, upload: false } until native lands
+```
+
+### Why might download/upload throw?
+
+`@milady/signal-native` currently only returns attachment **metadata** (`contentType`, `fileName`, `size`).  
+Presage (Rust) *can* `get_attachment` / upload, but those functions are **not bound** in the napi layer yet.
+
+This library:
+
+1. Exposes the full Baileys-style media API **now**
+2. Auto-detects `downloadAttachment` / `sendMessageWithAttachment` when upstream adds them
+3. Throws `ERR_SIGNAL_ATTACHMENT_NATIVE_MISSING` with a clear message until then
+
+Track / contribute: https://github.com/milady-ai/signal-native
+
+## Quick start
 
 ```ts
 import { makeSignalSocket, useMultiFileAuthState } from 'signal-baileys'
 
 const { state } = await useMultiFileAuthState('./signal-data')
-
 const sock = makeSignalSocket({
   auth: state,
   deviceName: 'My Bot',
@@ -57,9 +98,6 @@ sock.ev.on('messages.upsert', async (msgs) => {
     const text = m.message?.conversation
     if (text?.toLowerCase() === 'ping') {
       await sock.sendMessage(m.key.remoteJid, { text: 'pong' })
-      await sock.sendMessage(m.key.remoteJid, {
-        react: { text: '👍', key: { id: String(m.messageTimestamp) } },
-      })
     }
   }
 })
@@ -67,97 +105,41 @@ sock.ev.on('messages.upsert', async (msgs) => {
 await sock.connect()
 ```
 
-## Groups
+## Groups & reactions
 
 ```ts
 const groups = await sock.fetchGroups()
-// send to group (jid = `${group.id}@g.us` or master-key hex)
 await sock.sendMessage(`${groups[0].id}@g.us`, { text: 'hello group' })
 
-// Baileys-ish helper
-const map = await sock.groupFetchAllParticipating()
-```
-
-## Reactions
-
-```ts
-await sock.sendReaction(jid, '🔥', targetMessageTimestamp)
-
-// or Baileys-style content:
 await sock.sendMessage(jid, {
-  react: { text: '🔥', key: { id: String(targetTs), remoteJid: jid } },
+  react: { text: '🔥', key: { id: String(targetTs) } },
 })
 ```
-
-Incoming reactions appear as `msg.isReaction === true` with `msg.message.reactionMessage`.
-
-## Attachments
-
-Incoming messages include `msg.attachments[]` with `{ contentType, fileName, size }`.
-
-> **Note:** Binary download/upload is not exposed yet by `@milady/signal-native` (planned upstream). Metadata is fully available.
-
-## Primary registration
-
-```ts
-const sock = makeSignalSocket({
-  auth: './signal-data',
-  registration: { phoneNumber: '+234xxxxxxxxxx', useVoice: false },
-})
-
-sock.ev.on('connection.update', async (u) => {
-  if (u.registrationCodeRequired) {
-    await sock.confirmRegistration('123456') // from SMS
-  }
-})
-
-await sock.connect()
-```
-
-Prefer **linking** for bots unless you truly need a primary device. Native primary registration may still be incomplete upstream.
 
 ## Redis auth (metadata)
-
-Crypto still lives on disk under `dataPath`. Redis stores linked flag / phone / uuid metadata for multi-instance setups.
 
 ```ts
 import { useRedisAuthState, makeSignalSocket } from 'signal-baileys'
 
-const { state, saveMeta } = await useRedisAuthState({
+const { state } = await useRedisAuthState({
   dataPath: './signal-data',
   redisUrl: process.env.REDIS_URL!,
 })
-
-const sock = makeSignalSocket({ auth: state, printQRInTerminal: true })
-sock.ev.on('connection.update', async (u) => {
-  if (u.connection === 'open') {
-    await saveMeta({ linked: true, phoneNumber: sock.user?.phoneNumber })
-  }
-})
 ```
+
+Crypto keys stay on disk; Redis holds linked/phone metadata.
 
 ## Examples
 
 ```bash
-npm run example:link       # QR link
-npm run example:bot        # echo + ping + react + groups
-npm run example:register   # primary registration (experimental)
+npm run example:link
+npm run example:bot
+npm run example:register
 ```
-
-## Architecture
-
-```
-signal-baileys
-  └── @milady/signal-native (napi)
-        └── Presage (Rust)
-              └── libsignal-service-rs + libsignal
-```
-
-We focus on **developer experience** on top of a solid native backend instead of re-implementing the Signal protocol.
 
 ## License
 
-MIT (this package). Native dependency inherits Presage / AGPL constraints — check `@milady/signal-native` for details.
+MIT (this package). Check `@milady/signal-native` / Presage for AGPL implications.
 
 ---
 
