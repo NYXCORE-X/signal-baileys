@@ -5,6 +5,12 @@ export { useMultiFileAuthState, useRedisAuthState, resolveAuthPath } from './Uti
 export type { AuthMeta } from './Utils/auth.js'
 export { makeLogger } from './Utils/logger.js'
 export { printQRToTerminal, isProvisioningUrl } from './Utils/qr.js'
+export {
+  downloadMediaMessage,
+  downloadAttachment,
+  sendMediaMessage,
+  saveMediaToFile,
+} from './Utils/media.js'
 
 export type {
   SignalSocketConfig,
@@ -20,4 +26,6 @@ export type {
   SignalEventMap,
   SignalEvent,
   AnyMessageContent,
+  MediaUploadData,
+  MediaMessageFields,
 } from './types.js'
